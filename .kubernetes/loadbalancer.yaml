@@ -1,0 +1,14 @@
+# loadbalancer.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch-lb
+spec:
+  selector:
+    app: httpd-opensearch
+  ports:
+  - protocol: TCP
+    port: 443
+    targetPort: 443
+    name: https
+  type: LoadBalancer

@@ -1,0 +1,10 @@
+# configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensearch-config
+data:
+  CLUSTER_NAME: "opensearch-cluster"
+  FQH_NAME: "example.com"  # Replace with your fully qualified hostname
+  ADMIN_EMAIL: "admin@example.com"  # Replace with your email
+  INITIAL_MASTER_NODES: "opensearch-0,opensearch-2"

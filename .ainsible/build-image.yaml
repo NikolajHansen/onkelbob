@@ -1,0 +1,166 @@
+---
+- name: Build Stateless Multi-node OpenSearch with Spring Boot and Apache HTTPS Proxy
+  hosts: localhost
+  become: yes
+  vars:
+    docker_image_name: "httpd-opensearch"
+    docker_image_tag: "latest"
+    github_repo: "yourusername/yourrepo"  # Replace with your GitHub repo for Spring Boot app
+    github_static_repo: "yourusername/static-repo"  # Replace with your GitHub repo for static site
+    github_token: "your_personal_access_token"  # Replace with your GitHub PAT
+
+  tasks:
+    - name: Install required system packages
+      package:
+        name:
+          - docker.io
+          - python3-pip
+        state: present
+
+    - name: Install Docker Python module
+      pip:
+        name: docker
+        state: present
+
+    - name: Create directory for Docker build
+      file:
+        path: "/tmp/docker-build"
+        state: directory
+        mode: '0755'
+
+    - name: Create Dockerfile
+      copy:
+        dest: "/tmp/docker-build/Dockerfile"
+        content: |
+          FROM ubuntu:22.04
+
+          # Install required packages
+          RUN apt-get update && apt-get install -y \
+              apache2 \
+              apache2-utils \
+              curl \
+              openjdk-17-jdk \
+              certbot \
+              python3-certbot-apache \
+              cron \
+              unzip \  # Re-added for static site
+              && rm -rf /var/lib/apt/lists/*
+
+          # Install OpenSearch
+          RUN curl -o opensearch.tar.gz https://artifacts.opensearch.org/releases/bundle/opensearch/2.11.1/opensearch-2.11.1-linux-x64.tar.gz \
+              && tar -xzf opensearch.tar.gz \
+              && mv opensearch-2.11.1 /opt/opensearch \
+              && rm opensearch.tar.gz
+
+          # Download Spring Boot JAR from GitHub artifacts
+          RUN curl -L -H "Authorization: token ${github_token}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${github_repo}/actions/artifacts | \
+              jq -r '.artifacts[0].archive_download_url' | \
+              xargs curl -L -H "Authorization: token ${github_token}" \
+              -o /app/register-app.jar
+
+          # Download static site ZIP from GitHub artifacts
+          RUN curl -L -H "Authorization: token ${github_token}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${github_static_repo}/actions/artifacts | \
+              jq -r '.artifacts[0].archive_download_url' | \
+              xargs curl -L -H "Authorization: token ${github_token}" \
+              -o /tmp/static-site.zip && \
+              unzip /tmp/static-site.zip -d /var/www/hsys && \
+              rm /tmp/static-site.zip
+
+          # Enable Apache modules
+          RUN a2enmod ssl proxy proxy_http rewrite
+
+          # Create log and cert directories
+          RUN mkdir -p /var/log/apache2 && chmod 755 /var/log/apache2 && \
+              mkdir -p /etc/letsencrypt/live/www.hsys.dk && chmod 700 /etc/letsencrypt/live/www.hsys.dk
+
+          # Copy startup script and cron job
+          COPY start-services.sh /usr/local/bin/start-services.sh
+          COPY log-cleanup.cron /etc/cron.d/log-cleanup
+          RUN chmod +x /usr/local/bin/start-services.sh && \
+              chmod 0644 /etc/cron.d/log-cleanup
+
+          # Expose port
+          EXPOSE 443
+
+          # Start services
+          CMD ["/usr/local/bin/start-services.sh"]
+        mode: '0644'
+
+    - name: Create startup script
+      copy:
+        dest: "/tmp/docker-build/start-services.sh"
+        content: |
+          #!/bin/bash
+          # Configure OpenSearch from environment variables
+          cat > /opt/opensearch/config/opensearch.yml << EOF
+          cluster.name: \${CLUSTER_NAME:-opensearch-cluster}
+          node.name: \${NODE_NAME}
+          network.host: 0.0.0.0
+          http.port: 9200
+          discovery.seed_hosts: \${SEED_HOSTS}
+          cluster.initial_master_nodes: \${INITIAL_MASTER_NODES}
+          node.roles: \${NODE_ROLES}
+          EOF
+
+          # Apache configuration is mounted via Kubernetes Secret at /etc/apache2/sites-available/000-default.conf
+          # Obtain Let's Encrypt certificate for primary host if not present (fallback, ideally managed via Secret)
+          if [ ! -d "/etc/letsencrypt/live/\${FQH_NAME}" ]; then
+              certbot --apache -n --agree-tos \
+                  --email \${ADMIN_EMAIL} \
+                  -d \${FQH_NAME} \
+                  --redirect
+          fi
+
+          # Certificates are managed via Kubernetes Secrets
+          # To prepare:
+          # 1. Primary host cert: certbot certonly --standalone -d yourfqhname --email your@email.com --agree-tos -n
+          # 2. www.hsys.dk cert: certbot certonly --standalone -d www.hsys.dk --email your@email.com --agree-tos -n
+          # 3. Create Apache config file (000-default.conf) with both virtual hosts
+          # 4. Create Kubernetes Secrets:
+          #    - kubectl create secret generic apache-config --from-file=000-default.conf=/path/to/000-default.conf
+          #    - kubectl create secret generic primary-cert --from-file=fullchain.pem=/path/to/primary/fullchain.pem --from-file=privkey.pem=/path/to/primary/privkey.pem
+          #    - kubectl create secret generic hsys-cert --from-file=fullchain.pem=/path/to/hsys/fullchain.pem --from-file=privkey.pem=/path/to/hsys/privkey.pem
+
+          # Start cron daemon
+          service cron start
+
+          # Start OpenSearch
+          /opt/opensearch/bin/opensearch &
+
+          # Start Spring Boot application
+          java -jar /app/register-app.jar &
+
+          # Start Apache in foreground
+          apache2ctl -D FOREGROUND
+        mode: '0755'
+
+    - name: Create cron job for log cleanup
+      copy:
+        dest: "/tmp/docker-build/log-cleanup.cron"
+        content: |
+          # Clean up Apache logs older than 48 hours every 8 hours
+          0 */8 * * * root find /var/log/apache2/ -type f -mtime +2 -exec rm -f {} \;
+        mode: '0644'
+
+    - name: Build Docker image
+      docker_image:
+        name: "{{ docker_image_name }}"
+        tag: "{{ docker_image_tag }}"
+        source: build
+        build:
+          path: "/tmp/docker-build"
+          pull: yes
+        state: present
+      environment:
+        github_token: "{{ github_token }}"
+        github_repo: "{{ github_repo }}"
+        github_static_repo: "{{ github_static_repo }}"
+
+    - name: Clean up build directory
+      file:
+        path: "/tmp/docker-build"
+        state: absent

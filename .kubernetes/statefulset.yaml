@@ -1,0 +1,85 @@
+# statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: opensearch
+  labels:
+    app: httpd-opensearch
+spec:
+  serviceName: opensearch
+  replicas: 3
+  selector:
+    matchLabels:
+      app: httpd-opensearch
+  template:
+    metadata:
+      labels:
+        app: httpd-opensearch
+    spec:
+      containers:
+      - name: httpd-opensearch
+        image: httpd-opensearch:latest
+        ports:
+        - containerPort: 443
+          name: https
+        - containerPort: 9200
+          name: opensearch
+        - containerPort: 8080
+          name: spring-boot
+        env:
+        - name: CLUSTER_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: opensearch-config
+              key: CLUSTER_NAME
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SEED_HOSTS
+          value: "opensearch-0.opensearch,opensearch-1.opensearch,opensearch-2.opensearch"
+        - name: INITIAL_MASTER_NODES
+          valueFrom:
+            configMapKeyRef:
+              name: opensearch-config
+              key: INITIAL_MASTER_NODES
+        - name: FQH_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: opensearch-config
+              key: FQH_NAME
+        - name: ADMIN_EMAIL
+          valueFrom:
+            configMapKeyRef:
+              name: opensearch-config
+              key: ADMIN_EMAIL
+        - name: NODE_ROLES
+          value: >-
+            ${POD_ORDINAL == 0 || POD_ORDINAL == 2 ? "master,data" : "data"}
+        envFrom:
+        - configMapRef:
+            name: opensearch-config
+        volumeMounts:
+        - name: apache-config
+          mountPath: "/etc/apache2/sites-available/000-default.conf"
+          subPath: "000-default.conf"
+        - name: primary-cert
+          mountPath: "/etc/letsencrypt/live/yourfqhname"  # Replace with your FQH_NAME
+        - name: hsys-cert
+          mountPath: "/etc/letsencrypt/live/www.hsys.dk"
+      initContainers:
+      - name: init-sysctl
+        image: busybox
+        command: ["sysctl", "-w", "vm.max_map_count=262144"]
+        securityContext:
+          privileged: true
+      volumes:
+      - name: apache-config
+        secret:
+          secretName: apache-config
+      - name: primary-cert
+        secret:
+          secretName: primary-cert
+      - name: hsys-cert
+        secret:
+          secretName: hsys-cert
