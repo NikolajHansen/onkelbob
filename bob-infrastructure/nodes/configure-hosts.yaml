@@ -1,0 +1,98 @@
+---
+- name: Verify Nodes
+  hosts: all
+  gather_facts: false
+  tasks:
+    # Step 1: Verify node connectivity
+    - name: Ping all nodes
+      ansible.builtin.ping:
+      register: ping_result
+      failed_when: ping_result.ping != 'pong'
+
+    # Step 2: Verify SSH key login
+    - name: Check SSH key login
+      ansible.builtin.command: whoami
+      register: whoami_result
+      changed_when: false
+      failed_when: whoami_result.rc != 0
+
+    # Step 3: Verify sudo access
+    - name: Verify sudo access
+      ansible.builtin.command: sudo -n true
+      register: sudo_result
+      changed_when: false
+      failed_when: sudo_result.rc != 0
+
+- name: Install K3s Cluster
+  hosts: all
+  become: true
+  tasks:
+    # Step 4: Install K3s on master01
+    - name: Install K3s on master
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.26.6+k3s1 sh -s - server --disable traefik
+      args:
+        creates: /etc/rancher/k3s/k3s.yaml
+      when: inventory_hostname == 'master01'
+
+    - name: Get K3s node token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: node_token
+      when: inventory_hostname == 'master01'
+
+    - name: Copy K3s config to local
+      ansible.builtin.fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: ~/.kube/config-k3s
+        flat: true
+      when: inventory_hostname == 'master01'
+
+    # Step 4: Install K3s on workers (node01 to node09)
+    - name: Install K3s on workers
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.26.6+k3s1 K3S_URL=https://{{ hostvars['master01'].ansible_host }}:6443 K3S_TOKEN={{ hostvars['master01'].node_token.content | b64decode }} sh -s - agent
+      args:
+        creates: /etc/rancher/k3s/k3s.yaml
+      when: inventory_hostname in groups['workers']
+
+- name: Install Rancher
+  hosts: master01
+  become: true
+  tasks:
+    # Step 5: Install Helm
+    - name: Install Helm
+      ansible.builtin.shell: |
+        curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+
+    # Step 5: Add Rancher Helm repository
+    - name: Add Rancher Helm repo
+      ansible.builtin.shell: helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+      changed_when: true
+
+    # Step 5: Create cattle-system namespace
+    - name: Create cattle-system namespace
+      ansible.builtin.shell: kubectl create namespace cattle-system
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: true
+
+    # Step 5: Install cert-manager
+    - name: Install cert-manager
+      ansible.builtin.shell: kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.11.0/cert-manager.yaml
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: true
+
+    # Step 5: Install Rancher
+    - name: Install Rancher
+      ansible.builtin.shell: |
+        helm install rancher rancher-stable/rancher \
+          --namespace cattle-system \
+          --set hostname=rancher.yourdomain.com \
+          --set replicas=1
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      changed_when: true
